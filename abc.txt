@@ -1,74 +1,48 @@
-# CONTEXT
-I'm a data scientist on an equity execution team. I have tick-level
-quote and trade data for 4 markets: Hong Kong, India, Shanghai, Shenzhen.
-I've merged all markets into two dataframes: df_trade and df_quote.
+Here's how to think about it: your manager is the head of DS, so don't bring him *how* questions you can answer yourself (which library, how to code a z-score). Bring him **decisions that need his judgment, business context you can't see, and risks he'd want to know about.** That's what makes a junior look thoughtful rather than stuck.
 
-## Data schemas
-df_trade  (~566k rows, 8 cols): date, sym, time, localtime, price, size,
-          cond (all NaN), source_file
-df_quote  (~240k rows, 9 cols): date, sym, time, markettime, bid, ask,
-          bsize, asize, source_file
-Symbols look like 0700.HK (HK, ~563 HKD) and 300059.SZ (Shenzhen, ~21.56 CNY).
+I'll organize this end-to-end, in the order a good conversation would flow. Under each, the questions worth asking and *why they matter* — so you understand them, not just recite them.
 
-## Market microstructure (differs per market — this matters)
-- Hong Kong: continuous quotes + continuous trades (true event stream)
-- Shanghai:  3-sec quote snapshots + continuous trades
-- Shenzhen:  3-sec quote snapshots + CONFLATED trades
-- India:     1-sec quote snapshots + CONFLATED trades
-Session times (from a metadata sheet):
-- India:     09:15–15:30, no lunch
-- Hong Kong: 09:30–16:00, lunch 12:00–13:00
-- Shanghai:  09:30–14:57 (cont.), lunch 11:30–13:00
-- Shenzhen:  09:30–14:57 (cont.), lunch 11:30–13:00
+## 1. Business framing & success
+The thing you most lack as a finance newcomer is *what this signal is actually for*. Ask:
+- **"Who consumes this prediction, and what decision do they make with it?"** A return forecast feeding a human trader vs. an automated execution algo are different products. It changes your horizon priorities and latency needs.
+- **"What does 'good enough to be useful' look like?"** In finance a model can be 'right' only 52% of the time and still be valuable. Ask what information coefficient / hit-rate / Sharpe would make this worth deploying. Without this you can't tell success from noise.
+- **"Is the goal alpha (predicting direction to profit) or execution quality (timing/cost reduction)?"** You're on an execution desk, so likely the latter — confirm it, because it reframes the whole target.
 
-## Known data-quality issues to fix FIRST
-- HK timestamps are mangled (show "30:00.2" — hour dropped). Shenzhen is clean
-  ("14:56:46.155"). Need uniform tz-aware datetimes (IST/HKT/CST per market).
-- `date` is mixed format: "3/17/2026" (HK) vs "2026-03-17" (SZ).
-- cond is all NaN (no trade-condition codes to filter auctions/crosses).
-- Quotes are L1 only (single bid/ask/bsize/asize).
+## 2. The target (you've decided log return — pressure-test it)
+You've chosen regression on log returns, 3 horizons. Good. But surface these:
+- **"Should the target be mid, or microprice?"** You have bid/ask sizes; microprice is usually better short-horizon. Worth his view since it's a modeling-philosophy call.
+- **"Do we normalize the return (by volatility / spread), or predict raw log return?"** This is the symbol-agnostic question. A raw +5bps means different things on different names. Frame it as: *"I'm planning to predict vol-normalized log return so it's comparable across instruments — does that fit how the desk would use it?"* You're showing a plan and inviting correction, not asking permission.
+- **"Are 5/30/60 min the right horizons, or driven by something specific?"** Maybe the desk only cares about one. Three models is three times the work — confirm all three are wanted.
 
-# GOAL
-Build a symbol-agnostic regression model that predicts forward short-horizon
-returns, for execution signal generation. THREE separate models, one per horizon:
-5 min, 30 min, 60 min.
+## 3. Data scope & reality (the questions that save you weeks)
+This is where a newcomer earns trust by catching things early:
+- **"How much history will we get? Right now I have ~1 day."** *This is the single most important question.* One day can't validate anything (you can't test across market regimes, can't compute causal cross-day statistics). Say plainly: *"I can build the framework on one day, but I won't be able to trust any performance number until we have multiple days/months. What's the path to more data?"*
+- **"How were the trades pre-filtered?"** You learned `cond` = continuous flag and the data's already filtered to continuous. Confirm: *"Is anything else stripped (odd lots, off-book, certain venues)?"* — affects what your model has and hasn't seen.
+- **"For snapshot markets (India 1s, China 3s), how should I treat quotes between snapshots?"** This is a real open decision in your appendix. He'll have an opinion.
+- **"Will the live/production data look exactly like this?"** If you train on clean historical data but production has latency or different fields, the model breaks. Ask now.
 
-# DESIGN DECISIONS ALREADY MADE (follow these)
-1. Bars: start with VOLUME bars (conflation preserves size, so volume bars are
-   robust to the tick/conflation differences). Dollar bars later as an upgrade.
-2. Bar threshold: PER-SYMBOL, from a TRAILING (causal) volume estimate, targeting
-   ~N bars/session. Never full-sample (leakage).
-3. Bars must NOT cross session boundaries — reset accumulator at lunch, close,
-   and day boundaries. Build bars per (symbol, date, session) group.
-4. Drop incomplete final bars (partial volume scale).
-5. Symbol-agnostic = symbol-agnostic MODEL but symbol-AWARE normalization:
-   - No symbol/market/source_file as features.
-   - Features dimensionless (OBI, relative spread in bps, microprice offset)
-     or self-standardized causally per symbol (trailing window).
-6. Features computed from data up to time t only. Same feature matrix X for all
-   three horizons; only the label changes.
-7. Target: forward MICROPRICE return (microprice = (bid*asize + ask*bsize)/
-   (bsize+asize)), in bps, then normalized by trailing realized vol matched to
-   each horizon ("sigma units"). Predicting CHANGE, not level.
-8. Per-horizon purge + embargo in walk-forward CV, sized to the horizon
-   (>=5/30/60 min). Long-horizon labels overlap heavily — consider uniqueness/
-   sample weighting.
-9. Model: CatBoost regressor, pooled across all symbols/markets.
-10. Evaluate with rank/sign quality (information coefficient / directional
-    accuracy), not just RMSE.
+## 4. Approach & methodology (show your plan, invite steering)
+Don't ask open "what should I do" — present and ask for steering:
+- **"My plan is volume bars first (robust to the conflation differences across markets), then dollar bars as an upgrade. Reasonable?"** Shows you understood the data quirk.
+- **"For validation I'm using walk-forward with a purge+embargo sized to each horizon, to avoid look-ahead leakage. Is that the standard here?"** Leakage is *the* cardinal sin in trading models — flagging that you're guarding against it signals maturity.
+- **"One pooled model across all markets/symbols with dimensionless features, no instrument identity — or does the desk expect per-market models?"** A genuine architecture fork he should weigh in on.
 
-# WHAT I WANT FROM YOU
-[Pick one per message:]
-- Timestamp + date cleaning across the 4 markets
-- Session assignment (per market, with lunch breaks; India has none)
-- Causal per-symbol volume-bar threshold calculation
-- Volume bar construction (per symbol/date/session, drop partial bars, track VWAP)
-- L1 feature engineering (dimensionless + causal standardization)
-- Label construction (forward microprice return, bps, horizon-matched vol-normalized)
-- Session-boundary-safe label masking (no label spans lunch/close)
-- Walk-forward CV with per-horizon purge+embargo
-- Training + IC/directional evaluation
+## 5. Evaluation & what 'done' means
+- **"What's the baseline I'm being compared against?"** Is there an existing signal? Beating 'predict zero' is the minimum; beating an incumbent model is the real bar.
+- **"Should I optimize for ranking (IC), direction (hit-rate), or calibrated magnitude?"** Different metrics, different models. For execution, ranking/direction usually wins.
+- **"How will we know it works *out-of-sample* before risking anything?"** Ties back to the data-history question.
 
-Constraints: Python, pandas/numpy, CatBoost. Causal/leakage-safe throughout.
-Direct and comprehensive — math + working code, no scaffolded/Socratic teaching.
-Start with: [FILL IN THE STEP YOU WANT].
+## 6. Risks & constraints (managers love a junior who thinks about these)
+- **"What's the latency budget?"** If predictions must be live in milliseconds, that constrains feature complexity.
+- **"Any compliance/model-governance steps I should design for from the start?"** Banks (HSBC especially) have model-risk processes — knowing early avoids rework.
+- **"What's the timeline and what does the v0 milestone need to show?"** So you scope correctly.
+
+---
+
+**Two pieces of framing advice for the conversation itself:**
+
+First, **lead with the data-history question.** It's the one with the biggest impact on everything and the one you can't solve alone. If you only ask one thing, ask that.
+
+Second, **present decisions as proposals, not questions.** Compare *"What target should I use?"* (sounds lost) vs. *"I'm planning vol-normalized log microprice return across three horizons, validated walk-forward with leakage guards — I'd like your steer on the target normalization and whether all three horizons are needed."* The second tells him you've done the thinking and need his judgment on the parts only he can answer. That's exactly the junior↔head-of-DS dynamic that builds trust.
+
+Want me to turn this into a one-page agenda you can actually bring to the meeting — grouped, with the proposals pre-written so you can speak from it?
