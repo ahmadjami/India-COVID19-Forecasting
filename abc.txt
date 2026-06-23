@@ -1,48 +1,567 @@
-Here's how to think about it: your manager is the head of DS, so don't bring him *how* questions you can answer yourself (which library, how to code a z-score). Bring him **decisions that need his judgment, business context you can't see, and risks he'd want to know about.** That's what makes a junior look thoughtful rather than stuck.
+# Equity Short-Horizon Prediction — Deep-Dive Research & Framework
 
-I'll organize this end-to-end, in the order a good conversation would flow. Under each, the questions worth asking and *why they matter* — so you understand them, not just recite them.
+**Framing:** Senior applied/forward-deployed data scientist treatment of feature engineering, data alignment, session handling, target formulation, feature architecture, and the end-to-end pipeline for ML on heterogeneous multi-market equity data (trades, quotes, snapshots, bars).
 
-## 1. Business framing & success
-The thing you most lack as a finance newcomer is *what this signal is actually for*. Ask:
-- **"Who consumes this prediction, and what decision do they make with it?"** A return forecast feeding a human trader vs. an automated execution algo are different products. It changes your horizon priorities and latency needs.
-- **"What does 'good enough to be useful' look like?"** In finance a model can be 'right' only 52% of the time and still be valuable. Ask what information coefficient / hit-rate / Sharpe would make this worth deploying. Without this you can't tell success from noise.
-- **"Is the goal alpha (predicting direction to profit) or execution quality (timing/cost reduction)?"** You're on an execution desk, so likely the latter — confirm it, because it reframes the whole target.
-
-## 2. The target (you've decided log return — pressure-test it)
-You've chosen regression on log returns, 3 horizons. Good. But surface these:
-- **"Should the target be mid, or microprice?"** You have bid/ask sizes; microprice is usually better short-horizon. Worth his view since it's a modeling-philosophy call.
-- **"Do we normalize the return (by volatility / spread), or predict raw log return?"** This is the symbol-agnostic question. A raw +5bps means different things on different names. Frame it as: *"I'm planning to predict vol-normalized log return so it's comparable across instruments — does that fit how the desk would use it?"* You're showing a plan and inviting correction, not asking permission.
-- **"Are 5/30/60 min the right horizons, or driven by something specific?"** Maybe the desk only cares about one. Three models is three times the work — confirm all three are wanted.
-
-## 3. Data scope & reality (the questions that save you weeks)
-This is where a newcomer earns trust by catching things early:
-- **"How much history will we get? Right now I have ~1 day."** *This is the single most important question.* One day can't validate anything (you can't test across market regimes, can't compute causal cross-day statistics). Say plainly: *"I can build the framework on one day, but I won't be able to trust any performance number until we have multiple days/months. What's the path to more data?"*
-- **"How were the trades pre-filtered?"** You learned `cond` = continuous flag and the data's already filtered to continuous. Confirm: *"Is anything else stripped (odd lots, off-book, certain venues)?"* — affects what your model has and hasn't seen.
-- **"For snapshot markets (India 1s, China 3s), how should I treat quotes between snapshots?"** This is a real open decision in your appendix. He'll have an opinion.
-- **"Will the live/production data look exactly like this?"** If you train on clean historical data but production has latency or different fields, the model breaks. Ask now.
-
-## 4. Approach & methodology (show your plan, invite steering)
-Don't ask open "what should I do" — present and ask for steering:
-- **"My plan is volume bars first (robust to the conflation differences across markets), then dollar bars as an upgrade. Reasonable?"** Shows you understood the data quirk.
-- **"For validation I'm using walk-forward with a purge+embargo sized to each horizon, to avoid look-ahead leakage. Is that the standard here?"** Leakage is *the* cardinal sin in trading models — flagging that you're guarding against it signals maturity.
-- **"One pooled model across all markets/symbols with dimensionless features, no instrument identity — or does the desk expect per-market models?"** A genuine architecture fork he should weigh in on.
-
-## 5. Evaluation & what 'done' means
-- **"What's the baseline I'm being compared against?"** Is there an existing signal? Beating 'predict zero' is the minimum; beating an incumbent model is the real bar.
-- **"Should I optimize for ranking (IC), direction (hit-rate), or calibrated magnitude?"** Different metrics, different models. For execution, ranking/direction usually wins.
-- **"How will we know it works *out-of-sample* before risking anything?"** Ties back to the data-history question.
-
-## 6. Risks & constraints (managers love a junior who thinks about these)
-- **"What's the latency budget?"** If predictions must be live in milliseconds, that constrains feature complexity.
-- **"Any compliance/model-governance steps I should design for from the start?"** Banks (HSBC especially) have model-risk processes — knowing early avoids rework.
-- **"What's the timeline and what does the v0 milestone need to show?"** So you scope correctly.
+**Scope note:** This is the *full method space*, deliberately not narrowed to any one dataset. Where a method needs data you may not have (order-book messages, fundamentals, auctions, multi-day history), that requirement is stated so you can map it to what you actually possess.
 
 ---
 
-**Two pieces of framing advice for the conversation itself:**
+## 1. Feature Engineering Framework
 
-First, **lead with the data-history question.** It's the one with the biggest impact on everything and the one you can't solve alone. If you only ask one thing, ask that.
+The organizing idea: features fall on a spectrum from **universal** (computable on almost any equity feed) to **structure-specific** (need a particular data richness). Build the universal core first; add structure-specific layers where the feed supports them. Critically, for a *pooled, cross-market* model, the feature **schema** should be shared — markets that can't support a feature emit NaN/degraded values rather than getting a different column set.
 
-Second, **present decisions as proposals, not questions.** Compare *"What target should I use?"* (sounds lost) vs. *"I'm planning vol-normalized log microprice return across three horizons, validated walk-forward with leakage guards — I'd like your steer on the target normalization and whether all three horizons are needed."* The second tells him you've done the thinking and need his judgment on the parts only he can answer. That's exactly the junior↔head-of-DS dynamic that builds trust.
+### 1.1 Core universal features (work on any price+volume feed)
 
-Want me to turn this into a one-page agenda you can actually bring to the meeting — grouped, with the proposals pre-written so you can speak from it?
+| Feature | Why useful | Data needed | Notes |
+|---|---|---|---|
+| Log returns over multiple lookbacks | momentum / reversal signal; scale-free | price | compute over several windows (multi-scale) |
+| Realized volatility (rolling) | risk regime; normalizer for targets | price | sum of squared returns over window |
+| Relative spread (bps) | liquidity/cost; predictive of short moves | bid/ask | (ask−bid)/mid × 1e4 — dimensionless |
+| Mid / microprice | fair-value anchor | bid/ask(/sizes) | microprice if sizes available |
+| Volume / turnover (rolling, normalized) | participation intensity | size(,price) | normalize per symbol |
+| Return autocorrelation | trend vs mean-revert tendency | price | |
+| Range (high−low)/mid over window | intrabar volatility proxy | price | |
+
+These survive across markets because they're ratios or normalized quantities. **This is the layer to nail first.**
+
+### 1.2 Microstructure features (need quote and/or trade granularity)
+
+| Feature | Why useful | Data needed | Applicability |
+|---|---|---|---|
+| Order-book imbalance (OBI) = (bsize−asize)/(bsize+asize) | short-horizon directional pressure | L1 sizes | any L1 feed |
+| Microprice offset / spread | where price "leans" vs mid | L1 quote+sizes | any L1 feed |
+| Multi-level book imbalance | deeper pressure | L2/L3 depth | rich feeds only |
+| Trade sign (tick rule / Lee-Ready) | aggressor direction | trades(+quotes) | needs reasonably continuous trades |
+| Order-flow imbalance (OFI) | net aggressive flow | signed trades | degraded on conflated feeds |
+| Trade intensity / arrival rate | activity bursts | trade timestamps | degraded on snapshots |
+| VPIN (vol-synchronized prob. informed trading) | toxicity / adverse selection | signed volume | needs decent trade resolution |
+| Kyle's λ (impact per unit flow) | price impact / depth proxy | signed vol + price | regression-based |
+| Amihud illiquidity = \|ret\|/dollar-vol | illiquidity | price+volume | robust, low data need |
+| Quote update frequency | feed activity / informativeness | quote timestamps | also a *granularity* signal |
+| Effective/realized spread | true cost vs quoted | trades+quotes | needs trade-quote alignment |
+
+**Applicability rule of thumb:** continuous tick feeds (e.g. a true HK-style stream) support the full set; **snapshot/conflated feeds** degrade the *flow* features (trade sign, OFI, intensity, VPIN) because events were pre-aggregated upstream. Book-depth features need L2+ which most consolidated feeds lack.
+
+### 1.3 Cross-sectional features (need a universe observed simultaneously)
+
+| Feature | Why useful | Data needed |
+|---|---|---|
+| Cross-sectional rank of return/vol/OBI at time t | relative strength within universe | many symbols, aligned clock |
+| Sector/market-relative return (return − basket return) | strips common factor | universe + grouping |
+| Beta / correlation to index | systematic exposure | universe + index |
+| Cross-sectional z-score of a feature | normalizes against peers, not own past | aligned universe |
+
+Cross-sectional features are the backbone of classic equity alpha but require a **broad universe trading on the same clock**. They are awkward across markets in different timezones (sessions don't overlap), so they're typically computed *within* a market/region during overlapping hours.
+
+### 1.4 Event-based features
+
+| Feature | Why useful | Data needed |
+|---|---|---|
+| Time since / magnitude of last large trade | block-trade impact | trades |
+| CUSUM-event flags (structural-break sampling) | mark significant moves | price |
+| Jump indicators (return > k·σ) | discontinuities | price |
+| Order-cancellation bursts | spoofing/withdrawal pressure | order messages (rare) |
+| News/economic-release dummies | scheduled vol | external calendar |
+
+### 1.5 Auction-related features
+
+| Feature | Why useful | Data needed |
+|---|---|---|
+| Open auction price / volume vs prior day | overnight demand imbalance | auction prints + history |
+| Indicative auction imbalance | pre-open pressure | auction-phase data |
+| Closing auction participation | end-of-day flow | auction prints |
+
+These need **auction-phase data and multi-day history**. If your feed is continuous-session only (auctions stripped), this entire category is unavailable — note it explicitly rather than pretending.
+
+### 1.6 Regime-based features
+
+| Feature | Why useful | Data needed |
+|---|---|---|
+| Current vol / historical vol ratio | high vs low vol regime | price history |
+| Trend strength (e.g. ADX-style) | trending vs ranging | price |
+| Spread regime (current spread / typical) | liquidity regime | quotes |
+| Volume regime (current / typical) | participation regime | volume |
+| Hidden-state / clustering label (e.g. GMM/HMM on vol) | data-driven regime | features + history |
+
+Regime features condition the model on *context* and often improve stability — a momentum feature behaves differently in a trending vs mean-reverting regime, and an explicit regime feature lets the model split on it.
+
+### 1.7 Fundamental features
+
+Market cap, PE, liquidity classification, float, sector. **Why useful:** cross-sectional risk/return differences; conditioning variables. **Data needed:** reference/fundamental data joined by symbol — an *external* dataset, not derivable from trades/quotes. For intraday short-horizon prediction these are slow-moving conditioning variables at best; they matter far more for multi-day/cross-sectional alpha than for 5-60 min execution signals.
+
+### 1.8 Time features
+
+| Feature | Why useful |
+|---|---|
+| Fraction-through-session (0→1) | captures open/close intensity, dimensionless, market-agnostic |
+| Sin/cos positional encoding of time-of-day | smooth cyclical representation |
+| Session phase one-hot (open/mid/close) | regime-by-time |
+| Minutes-to-close / minutes-from-open | proximity to liquidity events |
+
+**Best practice:** encode time as **fraction-through-the-current-session**, not raw clock — it's dimensionless and aligns the "open effect" across markets with different hours.
+
+---
+
+## 2. Data Alignment Methods
+
+The central problem: different feeds arrive on different clocks (fixed-interval bars, irregular ticks, snapshots, simultaneous quote updates). To build one ML table you must impose a **common sampling scheme**. The choices split into *how you sample time* and *how you join trades to quotes*.
+
+### 2.1 Sampling schemes (defining the bar / row)
+
+| Scheme | Bar closes when… | Advantages | Disadvantages | When to use |
+|---|---|---|---|---|
+| **Calendar/time bars** | fixed clock interval | trivial, aligned across symbols, easy cross-section | fat-tailed returns; over-samples quiet, under-samples active periods; arbitrary | baselines; cross-sectional alignment; when feeds are already minute-bars |
+| **Tick bars** | N events occur | returns closer to IID/normal; samples with activity | "tick" not comparable across venues with different conflation; sensitive to feed policy | single homogeneous continuous feed |
+| **Volume bars** | N shares trade | robust to conflation (size preserved); good statistical properties | ignores price level (1000 shares means different $ at different prices) | heterogeneous feeds where size is reliable |
+| **Dollar bars** | N traded value (price×size) | most robust across price levels, symbols, and over time as price drifts | needs price+size; threshold tuning | **default for cross-symbol / cross-market pooling** |
+| **Imbalance bars (TIB/VIB/DIB)** | signed-flow imbalance exceeds expectation | sample exactly when informed flow arrives | more complex; needs reliable signing | information-driven sampling; research |
+| **Run bars** | runs of same-sign flow exceed expectation | captures persistent directional flow | complex; parameter-sensitive | advanced microstructure |
+| **CUSUM event sampling** | cumulative move exceeds threshold | reduces redundant rows; event-focused | not fixed-frequency; needs care in labeling | event-driven models |
+
+**Why event bars (tick/volume/dollar) beat time bars statistically:** information does not arrive uniformly in clock time. Sampling by activity produces returns with more stable variance and lighter tails — easier for any model to learn. Among them, **dollar bars** are the most comparable across instruments and across time, which is exactly what a pooled multi-market model needs.
+
+### 2.2 Trade-to-quote alignment
+
+The recurring need: attach the prevailing quote (bid/ask/sizes) to each trade or bar, to compute spread, microprice, signed trades, effective spread.
+
+| Method | What it does | Advantages | Disadvantages |
+|---|---|---|---|
+| **As-of backward join** | attach most recent quote **at or before** event time | causal (no look-ahead); standard; fast (`merge_asof`) | quote may be stale on slow feeds |
+| As-of with **tolerance** | as above but null if nearest quote older than X | guards against stale snapshots | drops/flags some rows |
+| Nearest join (bidirectional) | attach closest quote either side | minimizes time gap | **can grab a future quote → leakage**; avoid for features/labels |
+| Interval/"valid-between" join | quote valid until next update | precise quote state | heavier; needs interval logic |
+
+**Cardinal rule:** for any feature or label, the join must be **backward-looking** (as-of, direction=backward). A nearest/forward join leaks the future and silently inflates results. Document the rule as: *"as-of backward, max staleness X seconds; rows exceeding staleness flagged/dropped."*
+
+### 2.3 Simultaneous quote updates (same timestamp)
+
+Multiple quotes at one timestamp are common. Options:
+- **Keep last** (the final state at that timestamp) — simplest, usually correct for "prevailing quote."
+- **Aggregate** (e.g. size-weighted, or max/min) — if you want a summary of the instant.
+- **Sequence-preserve** (keep all, use intra-timestamp order if a sequence number exists) — only if you have a reliable ordering field and a model that uses it.
+
+For window statistics, **keep-last** at each timestamp is the pragmatic, defensible default.
+
+### 2.4 Filling gaps: forward-fill vs interpolation
+
+| Method | Use for | Avoid for |
+|---|---|---|
+| **Forward-fill (carry last)** | quote *state* between snapshots (the book stays at last known until updated) | trade prices (no trade happened) |
+| **Interpolation** | smooth continuous quantities for visualization | **prices/quotes for modeling** — invents values that never traded → leakage-like artifacts |
+| **Leave as NaN** | genuine absence (no quote/trade) | when the model can't handle NaN |
+
+**Best practice:** forward-fill *quote state* (a posted quote remains valid until changed) with a **staleness cap**; do **not** interpolate prices. Snapshot markets specifically need a documented forward-fill policy for valuing trades between snapshots.
+
+### 2.5 Snapshot generation & quote aggregation
+
+To put heterogeneous feeds on a common representation, generate **snapshots** at your chosen sampling points: at each bar close, record the prevailing (as-of backward) quote state and the trade aggregates since the last bar. This converts ticks, snapshots, and bars into one uniform row format.
+
+### 2.6 Recommended standardized representation
+
+A single **bar table** keyed by `(symbol, market, session, bar_timestamp)` with:
+- **OHLC + volume + VWAP** (trade aggregates over the bar),
+- **prevailing quote** at bar close (bid/ask/sizes via as-of backward join),
+- **derived microstructure** (spread, OBI, microprice),
+- **bar metadata** (n_trades, n_quote_updates, bar duration — these double as data-quality/granularity features).
+
+This representation is feed-agnostic: continuous, snapshot, and pre-binned feeds all collapse into the same schema, enabling pooled cross-market modeling. **Dollar (or volume) bars are the recommended sampling scheme for this table.**
+
+---
+
+## 3. Handling Market Sessions
+
+Sessions are *market-aware* structure: keep them differentiated, never flatten them. The goal is that no feature or label ever treats a non-trading gap as continuous.
+
+### 3.1 The session phases
+
+| Phase | Characteristics | Handling |
+|---|---|---|
+| Pre-market | thin, indicative | usually excluded; or separate features |
+| Opening auction | single cross, price discovery | separate auction features; exclude from continuous-bar stream |
+| Continuous trading | the main session | the core modeling window |
+| Lunch break (Asian mkts) | trading halts | **gap** — segment around it |
+| Closing auction | single cross | separate features; exclude from continuous stream |
+| Half days / holidays | shortened/absent | calendar-driven handling |
+
+### 3.2 Session segmentation
+Split each day into **continuous-session blocks** (a market with a lunch break has two blocks; one without has a single block). Build bars and compute horizons **within** a block. Encode this as a `session` label so grouping makes the segmentation automatic — a bar physically cannot span a gap if each block is a separate group.
+
+### 3.3 Feature resetting rules
+- Reset rolling/cumulative features at **session-block boundaries** (cumulative volume restarts; rolling windows shouldn't reach across a gap).
+- Decide per feature whether it carries **across blocks within a day** (e.g. "today's cumulative volume" may span lunch intentionally) vs **resets per block** (e.g. short-window momentum must not jump lunch). Document each.
+- Reset **daily** for anything day-relative (open price, day's range).
+
+### 3.4 Volume normalization across sessions
+Volume has a strong **intraday U-shape** (heavy at open/close, light midday) and differs across days. Normalize by:
+- **time-of-day volume profile** (divide by the typical volume for this minute-of-session, estimated from history), and/or
+- **per-symbol ADV** (average daily volume) for cross-day comparability.
+This makes "is volume unusually high right now?" meaningful rather than just reflecting the time of day.
+
+### 3.5 Time encoding across sessions
+Use **fraction-through-session** and/or sin/cos encodings so the open/close effects align across markets with different hours and across blocks. Avoid raw clock time as a feature (it bakes in market identity and timezone).
+
+### 3.6 Avoiding data leakage (session-specific)
+- **Lookback windows** must clip at the session-block open (don't reach into the prior block/gap).
+- **Forward labels** must clip at the session-block close (a horizon that runs past the close, or across lunch, is invalid → NaN/drop).
+- **Normalization stats** (vol profile, ADV) must be **trailing/causal** — estimated from prior data, never the full sample.
+- **Auction data** (if present) must not leak into continuous-session features unless intended.
+
+---
+
+## 4. Return Prediction / Target Formulation
+
+### 4.1 Regression targets
+
+| Target | Definition | Advantages | Disadvantages | Use case | Leakage risk |
+|---|---|---|---|---|---|
+| Forward mid return | log(mid_{t+h}/mid_t) | simple, standard | mid ignores book imbalance; noisy at short h | general | low if backward features only |
+| Forward **microprice** return | log(micro_{t+h}/micro_t) | better short-horizon anchor (uses sizes) | needs L1 sizes | short horizons | low |
+| **VWAP** return | log(VWAP_{t→t+h}/VWAP_now) | matches execution benchmark | VWAP is a window average → smears timing; unstable on thin volume | execution-quality targets | **high if VWAP window uses future beyond h or whole session** |
+| Open-to-close return | log(close/open) | daily directional | not short-horizon; one per day | daily models | low |
+| Close-to-close return | log(close_t/close_{t-1}) | daily momentum | overnight gap mixing | daily models | low |
+
+### 4.2 Risk-adjusted targets
+
+| Target | Definition | Advantages | Disadvantages |
+|---|---|---|---|
+| **Volatility-normalized return** | forward return ÷ trailing realized vol | comparable across symbols & regimes ("sigma units"); stabilizes scale | needs causal vol estimate; vol window must match horizon |
+| Spread-normalized return | forward return ÷ spread | bakes transaction cost into target | spread can be noisy/thin |
+| Sharpe-like (return/vol over path) | path-based risk-adjusted | richer | more complex; path leakage risks |
+
+### 4.3 Other formulations
+
+| Target | Notes |
+|---|---|
+| **Triple-barrier label** (classification) | first to hit +k·σ / −k·σ / time barrier; spread- or vol-scaled; embeds cost threshold |
+| Trend-scanning label | sign/strength of statistically-fitted local trend |
+| Quantile/bucketed return | robust to target outliers; ordinal |
+| Sign-only (direction) | simplest classification; loses magnitude |
+| Meta-label | secondary target: should we *act* on the primary signal? (sizing/filtering) |
+
+### 4.4 Cross-cutting target principles
+- **Predict change, never level.** Levels are autocorrelated and trivially "predictable" but useless.
+- **Normalize for cross-symbol comparability** (vol or spread units) if pooling.
+- **Match the target to the decision.** Execution timing → short-horizon microprice/spread-normalized; alpha → longer, possibly cross-sectional.
+- **The dominant leakage source is the label window**: any statistic in the target computed over `[t, t+h]` (or beyond) must not feed features at t, and overlapping forward windows across rows must be handled in validation (purge/embargo) and optionally via uniqueness weighting.
+
+---
+
+## 5. Feature Construction Architecture
+
+### 5.1 A — Sliding-window (summary) features
+
+Collapse a trailing window (last N minutes / N trades / N bars) into a fixed vector of aggregates (returns, vol, OBI, spread, intensity, etc.).
+
+- **Complexity:** low. **Scalability:** high (vectorizable, `groupby().rolling()`).
+- **Information preservation:** lossy — summarizes the window.
+- **Robustness across markets:** high (works on any feed; degrades gracefully).
+- **Production suitability:** excellent — cheap, interpretable, low-latency.
+- **Best for:** tree models (CatBoost/LightGBM), tabular pipelines, limited data, longer horizons where raw sequences are too long/noisy.
+
+### 5.2 B — Raw tick sequences
+
+Feed the ordered sequence of recent trades/quotes/flow directly to a sequence model (RNN/LSTM/Temporal CNN/Transformer).
+
+- **Complexity:** high. **Scalability:** lower (sequence length, compute, GPU).
+- **Information preservation:** high — keeps order and fine structure.
+- **Robustness across markets:** lower — irregular spacing, conflation, and snapshot/continuous differences complicate a shared sequence representation.
+- **Production suitability:** harder (latency, infra, monitoring).
+- **Data hunger:** high — needs large multi-day/multi-symbol data or it overfits.
+- **Best for:** very short horizons, rich homogeneous feeds, abundant data.
+
+### 5.3 C — Hybrid approaches
+
+- **Aggregated features + small sequence model:** summarize fine detail into features, feed a short sequence of those to a light sequence model.
+- **Hierarchical representation:** micro-window summaries → sequence of summaries → model.
+- **Two-stage / meta-labeling:** a feature-based primary model + a secondary model deciding whether to act.
+
+- **Complexity:** medium-high. **Information preservation:** medium-high. **Robustness:** medium. **Production:** medium.
+- **Best for:** when summary features plateau and you have the data/infra to add sequence structure incrementally.
+
+### 5.4 Recommendation logic
+Start with **A (sliding-window summary)** — it dominates on data efficiency, robustness across heterogeneous feeds, latency, and interpretability, and it's the right base for tree models. Escalate to **C**, then **B**, only when (i) data volume is large, (ii) horizons are very short, and (iii) summary features have demonstrably plateaued. For longer horizons (30-60 min), raw sequences are typically too long and noisy to help — summaries win.
+
+---
+
+## 6. Recommended End-to-End Pipeline
+
+```
+RAW DATA (multi-market trades + quotes/snapshots/bars)
+        │
+        ▼
+SESSION HANDLING
+  • derive market; attach timezone + session schedule
+  • segment into continuous-session blocks (handle lunch/auctions/half-days/holidays)
+  • label session block; define reset rules
+        │
+        ▼
+DATA ALIGNMENT
+  • choose sampling scheme: dollar (or volume) bars  ◄ recommended common representation
+  • build bars per (symbol, session block); reset at boundaries; drop partial final bar
+  • as-of BACKWARD join quotes → bars (+ staleness tolerance)
+  • forward-fill quote state (capped); never interpolate prices
+  • emit standardized bar table (OHLCV+VWAP, prevailing quote, microstructure, metadata)
+        │
+        ▼
+FEATURE ENGINEERING
+  • universal core → microstructure → regime → time → (cross-sectional/event/auction where data allows)
+  • shared schema across markets; degraded/NaN where feed can't support a feature
+  • ALL causal (trailing); dimensionless or causally standardized (per-symbol)
+        │
+        ▼
+TARGET CONSTRUCTION
+  • forward return (microprice/mid/VWAP), in bps/log
+  • risk-normalize (÷ trailing vol → sigma units) for cross-symbol comparability
+  • multiple horizons (e.g. 5/30/60 min); session-clip both lookback and lookahead
+        │
+        ▼
+TRAIN / VALIDATION SPLIT (time-aware)
+  • walk-forward (rolling/expanding), never random
+  • PURGE + EMBARGO sized to horizon (+lookback) to kill overlap leakage
+  • optional uniqueness/sample weighting for overlapping labels
+  • (at scale) combinatorial purged CV
+        │
+        ▼
+MODELING
+  • baseline: linear/ElasticNet + naive (zero/persistence)
+  • primary: gradient-boosted trees (CatBoost/LightGBM), pooled, no identity features
+  • one model per horizon (or multi-task later); sequence/hybrid only when justified
+        │
+        ▼
+BACKTESTING
+  • out-of-sample, transaction-cost aware; respect latency; no look-ahead
+  • simulate the actual decision the signal feeds (execution timing / sizing)
+        │
+        ▼
+EVALUATION
+  • rank/sign first: Information Coefficient (Spearman), directional accuracy
+  • rolling IC stability; per-market / per-liquidity diagnostic slices
+  • RMSE/MAE secondary; deflated Sharpe / PBO to detect overfit; SHAP for sanity
+        │
+        ▼
+DEPLOYMENT
+  • match production data exactly to training (fields, latency, granularity)
+  • monitor feature drift, IC decay, data-quality gates
+  • model-governance / documentation (esp. regulated environments)
+  • retraining cadence; champion/challenger
+```
+
+### 6.1 Common pitfalls (the ones that actually sink projects)
+- **Look-ahead leakage** via non-causal stats, full-sample normalization, forward/nearest joins, or whole-session VWAP. *The #1 killer.*
+- **Overlapping-label leakage** across train/test without purge+embargo — backtest looks great, dies live.
+- **Tick bars across heterogeneous feeds** — conflation makes ticks non-comparable.
+- **Treating gaps as continuous** — windows crossing lunch/close.
+- **Mixing scales when pooling** — feeding raw price/size; learning instrument identity instead of behavior.
+- **Evaluating on RMSE only** — misses that ordering/direction is what matters for a signal.
+- **Trusting one-day (or short) backtests** — no regime coverage.
+- **Train/prod skew** — clean historical data vs noisy/laggy production.
+
+### 6.2 Industry best practices
+- Causal-by-construction everywhere; if a step is in-sample (e.g. a bootstrap threshold), flag it explicitly and keep it out of features/labels.
+- Standardized feed-agnostic bar representation so adding markets/symbols is data, not code.
+- Dimensionless / per-symbol-causal normalization for a pooled, instrument-agnostic model.
+- Time-aware validation with purge+embargo; rank-based metrics; cost-aware backtests.
+- Baselines first; beat naive and linear before celebrating a complex model.
+- Reproducible, configured pipeline; data-quality gates; drift/IC monitoring in production.
+
+---
+
+*This document covers the broad method space across the six areas. It reflects established market-microstructure and financial-ML methodology; specific choices (which bars, which target, which horizons) should be fixed against the actual data available and the decision the signal serves.*
+
+---
+
+# Appendix B — Mathematics & Worked Examples on Your Data
+
+Every formula below is computed on **actual rows from your tables** so you can see the mechanics on numbers you recognize. Two reference rows are used throughout:
+
+**Quote row — `0700.HK` (Hong Kong):**
+`bid = 562.50, ask = 563.50, bsize = 2300, asize = 4800`
+
+**Quote row — `300059.SZ` (Shenzhen):**
+`bid = 21.55, ask = 21.56, bsize = 242500, asize = 581817`
+
+**Trade rows — `0700.HK`:** prices/sizes `(563.00, 5700), (563.00, 100), (563.50, 1000), (563.50, 100), (563.50, 100)`
+
+Your columns: trades = `date, sym, time, localtime, price, size`; quotes = `date, sym, markettime, bid, ask, bsize, asize`.
+
+---
+
+## B.1 Quote-based features (from `bid, ask, bsize, asize`)
+
+### Mid price
+$$\text{mid} = \frac{\text{bid} + \text{ask}}{2}$$
+- HK `0700`: (562.50 + 563.50)/2 = **563.00**
+- SZ `300059`: (21.55 + 21.56)/2 = **21.555**
+
+### Microprice (size-weighted fair value)
+$$\text{micro} = \frac{\text{bid}\cdot\text{asize} + \text{ask}\cdot\text{bsize}}{\text{bsize} + \text{asize}}$$
+- HK `0700`: (562.50·4800 + 563.50·2300)/(2300+4800) = 3,996,050 / 7100 = **562.8239**
+
+Note it sits **below** mid (563.00). Why: `asize` (4800) > `bsize` (2300) — more size resting on the ask → selling pressure → fair value leans down. The microprice captures that; the plain mid does not.
+
+### Relative spread (bps) — dimensionless cost
+$$\text{rel\_spread} = \frac{\text{ask} - \text{bid}}{\text{mid}} \times 10^4$$
+- HK `0700`: (1.00/563.00)·10⁴ = **17.76 bps**
+- SZ `300059`: (0.01/21.555)·10⁴ = **4.64 bps**
+
+This is exactly why raw spread can't be pooled: HK's 1.00 and SZ's 0.01 look 100× apart, but as a *fraction of price* SZ (4.6 bps) is the tighter, more liquid book and HK (17.8 bps) the wider one. The bps form makes them comparable.
+
+### Order-book imbalance (OBI) — dimensionless directional pressure
+$$\text{OBI} = \frac{\text{bsize} - \text{asize}}{\text{bsize} + \text{asize}} \in [-1, +1]$$
+- HK `0700`: (2300−4800)/7100 = **−0.352**
+- SZ `300059`: (242500−581817)/824317 = **−0.412**
+
+Both negative → ask-heavy → short-term downward lean. A 0.3 OBI means the same thing on any instrument in any currency — already symbol-agnostic, no normalization needed.
+
+### Microprice offset (normalized lean)
+$$\text{offset} = \frac{\text{micro} - \text{mid}}{\text{ask} - \text{bid}} \in [-0.5, +0.5]$$
+- HK `0700`: (562.8239 − 563.00)/1.00 = **−0.176**
+
+Dimensionless version of "how far toward the bid/ask does fair value sit." −0.176 = leaning ~18% of the spread toward the bid side.
+
+---
+
+## B.2 Trade-based features (from `price, size`)
+
+### VWAP over a window
+$$\text{VWAP} = \frac{\sum_i \text{price}_i \cdot \text{size}_i}{\sum_i \text{size}_i}$$
+Using the five HK trades:
+- Numerator = 563.00·5800 + 563.50·1200 = 3,265,400 + 676,200 = 3,941,600
+- Denominator = 5800 + 1200 = 7000
+- **VWAP = 3,941,600 / 7000 = 563.0857**
+
+**Leakage warning:** for a *feature* or *label anchor* this must be a **trailing** VWAP (past trades only). A whole-session VWAP uses future trades → look-ahead.
+
+### Trade sign — tick rule
+$$s_i = \begin{cases} +1 & \text{price}_i > \text{price}_{i-1} \\ -1 & \text{price}_i < \text{price}_{i-1} \\ s_{i-1} & \text{price}_i = \text{price}_{i-1}\end{cases}$$
+HK trades 563.00 → 563.00 → 563.50 → 563.50 → 563.50:
+signs = [·, carry, **+1**, carry +1, carry +1] → the uptick to 563.50 is a buy-initiated print.
+
+### Trade sign — Lee-Ready (uses quote)
+Compare trade price to prevailing mid (via as-of backward join, §B.5):
+$$s_i = +1 \text{ if price}_i > \text{mid}, \;\; -1 \text{ if } < \text{mid}, \;\; \text{tick rule if } =$$
+With mid = 563.00: a trade at 563.50 > mid → **buy (+1)**; a trade at 563.00 = mid → fall back to tick rule.
+
+### Order-Flow Imbalance (OFI) — signed volume
+$$\text{OFI} = \sum_i s_i \cdot \text{size}_i$$
+With the buy-signed upticks (1000+100+100 = 1200): **OFI = +1200** over the window → net buying pressure.
+
+### Amihud illiquidity
+$$\text{Amihud} = \frac{|r|}{\text{dollar volume}}, \quad r = \ln\frac{p_{\text{end}}}{p_{\text{start}}}$$
+- |r| = |ln(563.50/563.00)| = 0.000888; dollar vol = 3,941,600
+- Amihud = 0.000888 / 3,941,600 ≈ **2.25 × 10⁻¹⁰** (scale by 10⁹ → 0.225 for usable magnitude)
+
+Higher = price moves more per dollar traded = less liquid.
+
+---
+
+## B.3 Bar construction (worked on the HK trades)
+
+### Volume bar (threshold = 7000 shares)
+Accumulate `size` until ≥ 7000:
+```
+5700 → 5800 → 6800 → 6900 → 7000 ✅ closes at trade 5
+```
+Resulting bar: open 563.00, high 563.50, low 563.00, close 563.50, volume 7000, VWAP 563.0857.
+
+### Dollar bar (threshold = $3,500,000)
+Accumulate `price·size`:
+```
+3,209,100 → 3,265,400 → 3,828,900 ✅ (≥3.5M) closes at trade 3
+```
+Closes one trade earlier than the volume bar — because trades 1–3 already turned over $3.83M. (With a $4M threshold it wouldn't close yet — total is $3.94M.) This is the key difference: dollar bars cut on *money*, so they self-adjust as price changes and stay comparable across the 563-priced HK name and the 21-priced SZ name.
+
+**Per-symbol threshold (so both names yield similar bar counts):**
+$$\text{threshold}_{\text{sym}} = \frac{\text{(trailing) daily \$volume}_{\text{sym}}}{\text{target bars per session}}$$
+
+---
+
+## B.4 Normalization (making HK and SZ comparable)
+
+### Per-symbol rolling z-score
+$$z_t = \frac{x_t - \mu_{\text{sym}}^{\text{trailing}}}{\sigma_{\text{sym}}^{\text{trailing}}}$$
+mean/std over a **trailing** window of *that symbol's own* history.
+
+### Divide by domain scale (sizes) — the cross-market fix
+Raw trade sizes aren't comparable: HK print = 5700 shares, SZ print = 136200 shares.
+$$\text{size\_mult} = \frac{\text{size}_t}{\text{median size}_{\text{sym}}^{\text{trailing}}}$$
+- HK: 5700 / 500 (its median) = **11.4× normal**
+- SZ: 136200 / 100000 (its median) = **1.36× normal**
+
+Now both are "multiples of this stock's normal trade size" — directly poolable. The model sees 11.4 vs 1.36, not 5700 vs 136200.
+
+### Rolling rank (outlier-proof alternative)
+Replace $x_t$ with its percentile inside the symbol's trailing window → bounded [0,1], immune to fat-finger spikes. Preferred for heavy-tailed microstructure quantities.
+
+---
+
+## B.5 The as-of backward join (trade ↔ quote)
+
+To attach a quote to each trade/bar **without look-ahead**:
+$$\text{quote}(t) = \text{the most recent quote with markettime} \le t$$
+```python
+pd.merge_asof(
+    trades.sort_values('localtime'),
+    quotes.sort_values('markettime'),
+    left_on='localtime', right_on='markettime',
+    by='sym', direction='backward',          # ← causal: never a future quote
+    tolerance=pd.Timedelta('3s')             # ← staleness cap (snapshot markets)
+)
+```
+**Why `direction='backward'` is non-negotiable:** a nearest/forward join could attach a quote from *after* the trade — leaking the future into your features/labels. The tolerance handles snapshot feeds (India 1s, China 3s): if the last quote is older than the cap, the row is flagged/dropped rather than trusted as fresh.
+
+---
+
+## B.6 Target construction (worked)
+
+### Forward microprice return, in bps
+$$y_t^{(h)} = \ln\!\frac{\text{micro}_{t+h}}{\text{micro}_t} \times 10^4$$
+If micro now = 562.82 and micro 5 min later = 563.40:
+$$y = \ln(563.40/562.82)\times10^4 = \textbf{10.3 bps}$$
+
+### Volatility-normalized (sigma units) — the symbol-agnostic label
+$$\tilde{y}_t^{(h)} = \frac{y_t^{(h)}}{\sigma_{\text{sym}}^{\text{trailing}}}$$
+If trailing per-bar vol σ = 8 bps:
+$$\tilde{y} = 10.3 / 8 = \textbf{1.29 sigma}$$
+Now "+1.29" means "a 1.29-sigma up-move for this instrument" — the same economic event whether it's HK or SZ. One threshold applies across all symbols.
+
+### Session-clip rule (no label crosses lunch/close)
+For a bar at $t$, the label is valid **only if** $t+h$ falls in the *same* session block:
+$$\tilde{y}_t^{(h)} = \text{NaN if } (t+h) > \text{session\_close or crosses lunch}$$
+
+---
+
+## B.7 Time encoding (session-aware, market-agnostic)
+
+### Fraction-through-session
+$$\text{frac} = \frac{t - \text{session\_open}}{\text{session\_close} - \text{session\_open}} \in [0,1]$$
+HK morning session 09:30–12:00, a trade at 10:30:
+$$\text{frac} = \frac{60\text{ min}}{150\text{ min}} = \textbf{0.40}$$
+Dimensionless and comparable across markets with different hours — 0.40 = "40% through the session" everywhere.
+
+### Cyclical encoding
+$$\text{sin}\Big(2\pi \cdot \text{frac}\Big), \quad \cos\Big(2\pi \cdot \text{frac}\Big)$$
+gives the model a smooth representation of intraday position (open/close effects) without feeding raw clock time (which would leak market/timezone identity).
+
+---
+
+## B.8 Realized volatility (the normalizer)
+
+$$\sigma_t^{\text{trailing}} = \sqrt{\sum_{i \in \text{window}} r_i^2}, \quad r_i = \ln\frac{\text{micro}_i}{\text{micro}_{i-1}}$$
+Computed over a trailing window of bars (per symbol, causal). This single quantity feeds both a **feature** (vol regime) and the **label normalizer** (sigma units). Match the window length to the horizon: a 5-min label normalized by a short vol window, a 60-min label by a longer one, so "sigma" means the same scale across horizons.
+
+---
+
+### How these map to your columns (quick reference)
+
+| Feature | Uses columns |
+|---|---|
+| mid, microprice, spread, OBI, offset | `bid, ask, bsize, asize` |
+| VWAP, trade sign (tick), OFI, Amihud, realized vol | `price, size` (+ ordering by `localtime`) |
+| Lee-Ready sign, effective spread | trade `price` + as-of `bid/ask` |
+| volume/dollar bars | `price, size`, grouped by `sym, date, session` |
+| size/return normalization | per-`sym` trailing stats |
+| session fraction, cyclical time | `localtime`/`markettime` + session schedule |
+| labels (forward return, vol-norm) | `micro` at bar close + trailing `σ` |
+
+All quantities are either **dimensionless by construction** (OBI, spread bps, offset, fraction) or **causally per-symbol normalized** (z-score, size-mult, vol-norm), which is what makes one pooled model across HK + SZ + SH + India valid.
